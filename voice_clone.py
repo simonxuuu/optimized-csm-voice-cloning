@@ -144,7 +144,7 @@ def generate_speech_with_context(
         max_audio_length_ms=15_000,  # Adjusted based on your feedback
         temperature=0.6,  # Lower temperature for more accurate pronunciation
         topk=20,  # More focused sampling for clearer speech
-        max_seq_len=2048*4 # Increased max seq len for longer audio but might cause issues so you might need to edit in the models.py as well 
+        max_seq_len=2048 # Increase max seq len for longer audio but might cause issues so you might need to edit in the models.py as well 
     )
     
     # Save the audio to the output directory
