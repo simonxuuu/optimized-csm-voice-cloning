@@ -166,3 +166,6 @@ def main():
         context_text=context_text,
         output_filename="cloned_voice.wav"
     )
+
+if __name__ == "__main__":
+    main()
