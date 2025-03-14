@@ -79,6 +79,7 @@ def generate_speech_with_speaker(
         max_audio_length_ms=30_000,  # Increased from 10_000 to allow for longer utterances
         temperature=0.7,  # Reduced temperature for more accurate pronunciation
         topk=30,  # Reduced from default 50 to make output more focused
+        max_seq_len=2048*4 # Increased max seq len for longer audio but might cause issues so you might need to edit in the models.py as well 
     )
     
     # Save the audio
