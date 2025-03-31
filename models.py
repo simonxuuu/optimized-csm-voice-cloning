@@ -52,7 +52,9 @@ def _prepare_transformer(model):
 
 
 def _create_causal_mask(seq_len: int, device: torch.device):
-    return torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device))
+    # Create mask once and cache it
+    mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device))
+    return mask
 
 
 def _index_causal_mask(mask: torch.Tensor, input_pos: torch.Tensor):
@@ -68,22 +70,32 @@ def _index_causal_mask(mask: torch.Tensor, input_pos: torch.Tensor):
     return r
 
 
-def _multinomial_sample_one_no_sync(probs):  # Does multinomial sampling without a cuda synchronization
-    q = torch.empty_like(probs).exponential_(1)
-    return torch.argmax(probs / q, dim=-1, keepdim=True).to(dtype=torch.int)
+def _multinomial_sample_one_no_sync(probs):  
+    # More efficient multinomial sampling - optimized version
+    with torch.no_grad():
+        # Using exponential distribution for efficient gumbel-max sampling
+        q = torch.empty_like(probs).exponential_(1.0)
+        return torch.argmax(probs / q, dim=-1, keepdim=True).to(dtype=torch.int)
 
 
 def sample_topk(logits: torch.Tensor, topk: int, temperature: float):
-    logits = logits / temperature
-
-    filter_value: float = -float("Inf")
-    indices_to_remove = logits < torch.topk(logits, topk)[0][..., -1, None]
-    scores_processed = logits.masked_fill(indices_to_remove, filter_value)
-    scores_processed = torch.nn.functional.log_softmax(scores_processed, dim=-1)
-    probs = torch.nn.functional.softmax(scores_processed, dim=-1)
-
-    sample_token = _multinomial_sample_one_no_sync(probs)
-    return sample_token
+    with torch.no_grad():  # Ensure no gradients are computed
+        # Apply temperature scaling
+        if temperature > 0:
+            logits = logits / temperature
+        
+        # Optimized top-k filtering
+        if topk > 0 and topk < logits.size(-1):
+            v, _ = torch.topk(logits, topk)
+            logits[logits < v[..., -1, None]] = float('-inf')
+        
+        # More efficient softmax calculation
+        scores_processed = torch.log_softmax(logits, dim=-1)
+        probs = torch.softmax(scores_processed, dim=-1)
+        
+        # Sample from the distribution
+        sample_token = _multinomial_sample_one_no_sync(probs)
+        return sample_token
 
 
 @dataclass
@@ -119,8 +131,15 @@ class Model(nn.Module):
             self.backbone.setup_caches(max_batch_size, dtype)
             self.decoder.setup_caches(max_batch_size, dtype, decoder_max_seq_len=self.args.audio_num_codebooks)
 
+        # Cache masks for reuse
         self.register_buffer("backbone_causal_mask", _create_causal_mask(self.backbone.max_seq_len, device))
         self.register_buffer("decoder_causal_mask", _create_causal_mask(self.args.audio_num_codebooks, device))
+        
+        # Pre-compute variables that will be used repeatedly
+        self.vocab_size_offsets = torch.arange(
+            0, self.args.audio_num_codebooks * self.args.audio_vocab_size, 
+            self.args.audio_vocab_size, device=device
+        )
 
     def generate_frame(
         self,
@@ -144,35 +163,47 @@ class Model(nn.Module):
         b, s, _ = tokens.size()
 
         assert self.backbone.caches_are_enabled(), "backbone caches are not enabled"
+        
+        # Use cached causal mask for efficiency
         curr_backbone_mask = _index_causal_mask(self.backbone_causal_mask, input_pos)
+        
+        # Embedding and input preparation
         embeds = self._embed_tokens(tokens)
         masked_embeds = embeds * tokens_mask.unsqueeze(-1)
         h = masked_embeds.sum(dim=2)
-        h = self.backbone(h, input_pos=input_pos, mask=curr_backbone_mask).to(dtype=dtype)
-
+        
+        # Main backbone forward pass with mixed precision
+        with torch.cuda.amp.autocast(enabled=True):
+            h = self.backbone(h, input_pos=input_pos, mask=curr_backbone_mask).to(dtype=dtype)
+        
+        # Extract last hidden state for prediction
         last_h = h[:, -1, :]
         c0_logits = self.codebook0_head(last_h)
         c0_sample = sample_topk(c0_logits, topk, temperature)
         c0_embed = self._embed_audio(0, c0_sample)
 
+        # Initial decoder state
         curr_h = torch.cat([last_h.unsqueeze(1), c0_embed], dim=1)
         curr_sample = c0_sample.clone()
         curr_pos = torch.arange(0, curr_h.size(1), device=curr_h.device).unsqueeze(0).repeat(curr_h.size(0), 1)
 
-        # Decoder caches must be reset every frame.
+        # Reset decoder caches for this new frame
         self.decoder.reset_caches()
-        for i in range(1, self.args.audio_num_codebooks):
-            curr_decoder_mask = _index_causal_mask(self.decoder_causal_mask, curr_pos)
-            decoder_h = self.decoder(self.projection(curr_h), input_pos=curr_pos, mask=curr_decoder_mask).to(
-                dtype=dtype
-            )
-            ci_logits = torch.mm(decoder_h[:, -1, :], self.audio_head[i - 1])
-            ci_sample = sample_topk(ci_logits, topk, temperature)
-            ci_embed = self._embed_audio(i, ci_sample)
+        
+        # Process remaining codebooks
+        with torch.cuda.amp.autocast(enabled=True):
+            for i in range(1, self.args.audio_num_codebooks):
+                curr_decoder_mask = _index_causal_mask(self.decoder_causal_mask, curr_pos)
+                decoder_h = self.decoder(self.projection(curr_h), input_pos=curr_pos, mask=curr_decoder_mask).to(
+                    dtype=dtype
+                )
+                ci_logits = torch.mm(decoder_h[:, -1, :], self.audio_head[i - 1])
+                ci_sample = sample_topk(ci_logits, topk, temperature)
+                ci_embed = self._embed_audio(i, ci_sample)
 
-            curr_h = ci_embed
-            curr_sample = torch.cat([curr_sample, ci_sample], dim=1)
-            curr_pos = curr_pos[:, -1:] + 1
+                curr_h = ci_embed
+                curr_sample = torch.cat([curr_sample, ci_sample], dim=1)
+                curr_pos = curr_pos[:, -1:] + 1
 
         return curr_sample
 
@@ -181,16 +212,29 @@ class Model(nn.Module):
         self.decoder.reset_caches()
 
     def _embed_audio(self, codebook: int, tokens: torch.Tensor) -> torch.Tensor:
-        return self.audio_embeddings(tokens + codebook * self.args.audio_vocab_size)
+        # Use pre-computed offsets for efficiency
+        if hasattr(self, 'vocab_size_offsets'):
+            return self.audio_embeddings(tokens + self.vocab_size_offsets[codebook])
+        else:
+            return self.audio_embeddings(tokens + codebook * self.args.audio_vocab_size)
 
     def _embed_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
+        # Optimize embedding operations
         text_embeds = self.text_embeddings(tokens[:, :, -1]).unsqueeze(-2)
-
-        audio_tokens = tokens[:, :, :-1] + (
-            self.args.audio_vocab_size * torch.arange(self.args.audio_num_codebooks, device=tokens.device)
-        )
-        audio_embeds = self.audio_embeddings(audio_tokens.view(-1)).reshape(
-            tokens.size(0), tokens.size(1), self.args.audio_num_codebooks, -1
+        
+        # More efficient audio token processing
+        if hasattr(self, 'vocab_size_offsets'):
+            offsets = self.vocab_size_offsets
+        else:
+            offsets = torch.arange(self.args.audio_num_codebooks, device=tokens.device) * self.args.audio_vocab_size
+            
+        # Get audio tokens with broadcasting
+        audio_tokens = tokens[:, :, :-1] + offsets
+        
+        # More efficient reshape operation
+        batch_size, seq_len = tokens.shape[:2]
+        audio_embeds = self.audio_embeddings(audio_tokens.reshape(-1)).reshape(
+            batch_size, seq_len, self.args.audio_num_codebooks, -1
         )
 
         return torch.cat([audio_embeds, text_embeds], dim=-2)

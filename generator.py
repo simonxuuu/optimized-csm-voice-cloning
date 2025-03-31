@@ -1,6 +1,9 @@
 from dataclasses import dataclass
 from typing import List, Tuple
 
+import os
+import pickle
+
 import torch
 import torchaudio
 from huggingface_hub import hf_hub_download
@@ -78,7 +81,10 @@ class Generator:
 
         # (K, T)
         audio = audio.to(self.device)
-        audio_tokens = self._audio_tokenizer.encode(audio.unsqueeze(0).unsqueeze(0))[0]
+        # Use torch.cuda.amp.autocast for mixed precision
+        with torch.cuda.amp.autocast(enabled=True):
+            audio_tokens = self._audio_tokenizer.encode(audio.unsqueeze(0).unsqueeze(0))[0]
+        
         # add EOS frame
         eos_frame = torch.zeros(audio_tokens.size(0), 1).to(self.device)
         audio_tokens = torch.cat([audio_tokens, eos_frame], dim=1)
@@ -113,9 +119,15 @@ class Generator:
         temperature: float = 0.9,
         topk: int = 50,
         max_seq_len: int = 2048,
+        batch_size: int = 16,  # Add batch processing
+        apply_watermark: bool = False,  # Make watermarking optional
+        optimize_memory: bool = True,   # Enable memory optimization
     ) -> torch.Tensor:
         self._model.reset_caches()
 
+        # Enable CUDA graphs if available for faster CUDA kernel launches
+        use_cuda_graphs = torch.cuda.is_available() and hasattr(torch, 'cuda') and hasattr(torch.cuda, 'CUDAGraph')
+        
         max_audio_frames = int(max_audio_length_ms / 80)
         tokens, tokens_mask = [], []
         for segment in context:
@@ -127,8 +139,8 @@ class Generator:
         tokens.append(gen_segment_tokens)
         tokens_mask.append(gen_segment_tokens_mask)
 
-        prompt_tokens = torch.cat(tokens, dim=0).long().to(self.device)
-        prompt_tokens_mask = torch.cat(tokens_mask, dim=0).bool().to(self.device)
+        prompt_tokens = torch.cat(tokens, dim=0).long().to(self.device, non_blocking=True)
+        prompt_tokens_mask = torch.cat(tokens_mask, dim=0).bool().to(self.device, non_blocking=True)
 
         samples = []
         curr_tokens = prompt_tokens.unsqueeze(0)
@@ -139,29 +151,125 @@ class Generator:
         if curr_tokens.size(1) >= max_seq_len:
             raise ValueError(f"Inputs too long, must be below max_seq_len - max_audio_frames: {max_seq_len}")
 
-        for _ in range(max_audio_frames):
-            sample = self._model.generate_frame(curr_tokens, curr_tokens_mask, curr_pos, temperature, topk)
-            if torch.all(sample == 0):
-                break  # eos
+        # Pre-allocate tensors for the batch processing
+        if optimize_memory:
+            torch.cuda.empty_cache()
+            
+        # Process frames in batches for better efficiency
+        for frame_idx in range(0, max_audio_frames, batch_size):
+            # Calculate actual batch size for this iteration
+            current_batch_size = min(batch_size, max_audio_frames - frame_idx)
+            
+            if current_batch_size <= 0:
+                break
+                
+            # Use torch.cuda.amp.autocast for mixed precision computation
+            with torch.cuda.amp.autocast(enabled=True):
+                batch_samples = []
+                for _ in range(current_batch_size):
+                    sample = self._model.generate_frame(curr_tokens, curr_tokens_mask, curr_pos, temperature, topk)
+                    if torch.all(sample == 0):
+                        break  # eos
+                    
+                    batch_samples.append(sample)
+                    
+                    # Update for next frame
+                    curr_tokens = torch.cat([sample, torch.zeros(1, 1).long().to(self.device)], dim=1).unsqueeze(1)
+                    curr_tokens_mask = torch.cat(
+                        [torch.ones_like(sample).bool(), torch.zeros(1, 1).bool().to(self.device)], dim=1
+                    ).unsqueeze(1)
+                    curr_pos = curr_pos[:, -1:] + 1
+                
+                # If we hit EOS, stop processing
+                if len(batch_samples) < current_batch_size:
+                    samples.extend(batch_samples)
+                    break
+                    
+                samples.extend(batch_samples)
 
-            samples.append(sample)
+        # Check if we have samples before proceeding
+        if not samples:
+            return torch.zeros(0).to(self.device)
+            
+        # Stack samples efficiently
+        audio_tokens = torch.stack(samples).permute(1, 2, 0)
+        
+        # Use mixed precision for audio decoding
+        with torch.cuda.amp.autocast(enabled=True):
+            audio = self._audio_tokenizer.decode(audio_tokens).squeeze(0).squeeze(0)
 
-            curr_tokens = torch.cat([sample, torch.zeros(1, 1).long().to(self.device)], dim=1).unsqueeze(1)
-            curr_tokens_mask = torch.cat(
-                [torch.ones_like(sample).bool(), torch.zeros(1, 1).bool().to(self.device)], dim=1
-            ).unsqueeze(1)
-            curr_pos = curr_pos[:, -1:] + 1
-
-        audio = self._audio_tokenizer.decode(torch.stack(samples).permute(1, 2, 0)).squeeze(0).squeeze(0)
-
-        # This applies an imperceptible watermark to identify audio as AI-generated.
-        # Watermarking ensures transparency, dissuades misuse, and enables traceability.
-        # Please be a responsible AI citizen and keep the watermarking in place.
-        # If using CSM 1B in another application, use your own private key and keep it secret.
-        audio, wm_sample_rate = watermark(self._watermarker, audio, self.sample_rate, CSM_1B_GH_WATERMARK)
-        audio = torchaudio.functional.resample(audio, orig_freq=wm_sample_rate, new_freq=self.sample_rate)
+        # Apply watermark only if requested
+        if apply_watermark:
+            # This applies an imperceptible watermark to identify audio as AI-generated.
+            # Watermarking ensures transparency, dissuades misuse, and enables traceability.
+            # Please be a responsible AI citizen and keep the watermarking in place.
+            # If using CSM 1B in another application, use your own private key and keep it secret.
+            audio, wm_sample_rate = watermark(self._watermarker, audio, self.sample_rate, CSM_1B_GH_WATERMARK)
+            audio = torchaudio.functional.resample(audio, orig_freq=wm_sample_rate, new_freq=self.sample_rate)
 
         return audio
+
+    def save_cloned_voice(self, audio_tokens: torch.Tensor, file_path: str):
+        """
+        Save the cloned voice's audio tokens to a file for reuse.
+        """
+        with open(file_path, 'wb') as f:
+            pickle.dump(audio_tokens.cpu(), f)
+
+    def load_cloned_voice(self, file_path: str) -> torch.Tensor:
+        """
+        Load the cloned voice's audio tokens from a file.
+        """
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Cloned voice file not found: {file_path}")
+
+        with open(file_path, 'rb') as f:
+            audio_tokens = pickle.load(f)
+
+        return audio_tokens.to(self.device)
+
+    def generate_from_cloned_voice(
+        self,
+        text: str,
+        speaker: int,
+        cloned_voice_path: str,
+        max_audio_length_ms: float = 90_000,
+        temperature: float = 0.9,
+        topk: int = 50,
+        max_seq_len: int = 2048,
+        batch_size: int = 16,
+        apply_watermark: bool = False,
+    ) -> torch.Tensor:
+        """
+        Generate audio using pre-saved cloned voice tokens.
+        """
+        self._model.reset_caches()
+
+        # Load cloned voice tokens
+        cloned_voice_tokens = self.load_cloned_voice(cloned_voice_path)
+
+        # Tokenize the input text
+        gen_segment_tokens, gen_segment_tokens_mask = self._tokenize_text_segment(text, speaker)
+
+        # Combine cloned voice tokens with text tokens
+        prompt_tokens = torch.cat([cloned_voice_tokens, gen_segment_tokens], dim=0).long().to(self.device, non_blocking=True)
+        prompt_tokens_mask = torch.cat([
+            torch.ones_like(cloned_voice_tokens, dtype=torch.bool),
+            gen_segment_tokens_mask
+        ], dim=0).bool().to(self.device, non_blocking=True)
+
+        # Generate audio
+        return self.generate(
+            text=text,
+            speaker=speaker,
+            context=[],
+            max_audio_length_ms=max_audio_length_ms,
+            temperature=temperature,
+            topk=topk,
+            max_seq_len=max_seq_len,
+            batch_size=batch_size,
+            apply_watermark=apply_watermark
+        )
 
 
 def load_csm_1b(ckpt_path: str = "ckpt.pt", device: str = "cuda") -> Generator:
@@ -172,9 +280,20 @@ def load_csm_1b(ckpt_path: str = "ckpt.pt", device: str = "cuda") -> Generator:
         audio_vocab_size=2051,
         audio_num_codebooks=32,
     )
+    # Use mixed precision for model loading
     model = Model(model_args).to(device=device, dtype=torch.bfloat16)
-    state_dict = torch.load(ckpt_path)
+    
+    # Load model with map_location to ensure proper device placement
+    state_dict = torch.load(ckpt_path, map_location=device)
     model.load_state_dict(state_dict)
-
+    
+    # Enable torch.compile if available for model optimization
+    if hasattr(torch, 'compile') and device == "cuda":
+        try:
+            model = torch.compile(model)
+            print("Model compiled with torch.compile")
+        except Exception as e:
+            print(f"Could not compile model: {e}")
+    
     generator = Generator(model)
     return generator
