@@ -164,7 +164,27 @@ class Generator:
         return audio
 
 
-def load_csm_1b(ckpt_path: str = "ckpt.pt", device: str = "cuda") -> Generator:
+def load_csm_1b(ckpt_path: str = "ckpt.pt", device: str = "cuda", compile_model: bool = True, use_cached_compile: bool = True) -> Generator:
+    """
+    Load CSM 1B model with optional compilation.
+    
+    Args:
+        ckpt_path: Path to the model checkpoint
+        device: Device to load the model on ('cuda' or 'cpu')
+        compile_model: Whether to compile the model with torch.compile
+        use_cached_compile: Whether to load a previously cached compiled model (if available)
+                            or save the newly compiled model for future use
+    
+    Returns:
+        Generator instance
+    """
+    import os
+    import hashlib
+    
+    # Generate a hash from the checkpoint path to use in the cache filename
+    model_hash = hashlib.md5(ckpt_path.encode()).hexdigest()[:8]
+    cached_model_path = f"./compiled_model_cache_{model_hash}.pt"
+    
     model_args = ModelArgs(
         backbone_flavor="llama-1B",
         decoder_flavor="llama-100M",
@@ -172,9 +192,54 @@ def load_csm_1b(ckpt_path: str = "ckpt.pt", device: str = "cuda") -> Generator:
         audio_vocab_size=2051,
         audio_num_codebooks=32,
     )
-    model = Model(model_args).to(device=device, dtype=torch.bfloat16)
-    state_dict = torch.load(ckpt_path)
-    model.load_state_dict(state_dict)
+    
+    # Check if we should load a cached compiled model
+    if compile_model and use_cached_compile and os.path.exists(cached_model_path):
+        try:
+            print(f"Loading cached compiled model from {cached_model_path}...")
+            model = torch.load(cached_model_path, map_location=device)
+            print("Cached compiled model loaded successfully.")
+            model = model.to(device=device, dtype=torch.bfloat16)
+        except Exception as e:
+            print(f"Failed to load cached model: {e}")
+            print("Falling back to regular model loading...")
+            model = Model(model_args).to(device=device, dtype=torch.bfloat16)
+            state_dict = torch.load(ckpt_path)
+            model.load_state_dict(state_dict)
+    else:
+        # Load model normally
+        model = Model(model_args).to(device=device, dtype=torch.bfloat16)
+        state_dict = torch.load(ckpt_path)
+        model.load_state_dict(state_dict)
+    
+    # Apply torch.compile to optimize model execution if requested
+    if compile_model and (not use_cached_compile or not os.path.exists(cached_model_path)):
+        try:
+            print("Compiling model with torch.compile()...")
+            # Use fullgraph=True to prevent dtype issues
+            # Set mode to 'reduce-overhead' to prevent precision changes
+            compiled_model = torch.compile(
+                model, 
+                dynamic=True, 
+                fullgraph=True, 
+                mode='reduce-overhead',  # This preserves dtypes better
+                backend='inductor'       # Explicitly use the default backend
+            )
+            
+            # Save the compiled model for future use if caching is enabled
+            if use_cached_compile:
+                try:
+                    print(f"Saving compiled model to {cached_model_path} for faster future loading...")
+                    torch.save(compiled_model, cached_model_path)
+                    print("Compiled model cached successfully.")
+                except Exception as e:
+                    print(f"Warning: Failed to save compiled model: {e}")
+            
+            model = compiled_model
+            print("Model compilation complete.")
+        except Exception as e:
+            print(f"Warning: Model compilation failed with error: {e}")
+            print("Continuing with uncompiled model.")
 
     generator = Generator(model)
     return generator

@@ -126,8 +126,12 @@ class Model(nn.Module):
         """Setup KV caches and return a causal mask."""
         dtype = next(self.parameters()).dtype
         device = next(self.parameters()).device
+        
+        # Fix: Explicitly ensure the model, cache, and any inputs share the same dtype
+        self.model_dtype = dtype  # Save for reference 
 
         with device:
+            # Force all caches to use bfloat16 if that's what the model is using
             self.backbone.setup_caches(max_batch_size, dtype)
             self.decoder.setup_caches(max_batch_size, dtype, decoder_max_seq_len=self.args.audio_num_codebooks)
 
@@ -151,55 +155,70 @@ class Model(nn.Module):
     ) -> torch.Tensor:
         """
         Args:
-            tokens: (batch_size, seq_len, audio_num_codebooks+1)
-            tokens_mask: (batch_size, seq_len, audio_num_codebooks+1)
+            tokens: (batch_size, seq_len, audio_num_codebooks+1) or (batch_size, seq_len)
+            tokens_mask: (batch_size, seq_len, audio_num_codebooks+1) or (batch_size, seq_len)
             input_pos: (batch_size, seq_len) positions for each token
-            mask: (batch_size, seq_len, max_seq_len
-
+            
         Returns:
             (batch_size, audio_num_codebooks) sampled tokens
         """
-        dtype = next(self.parameters()).dtype
+        dtype = next(self.parameters()).dtype  # Ensure consistent dtype
+        
+        # Reshape tokens to have 3 dimensions if it doesn't already
+        if tokens.dim() == 2:
+            # If tokens is 2D (batch_size, seq_len), reshape to 3D
+            tokens = tokens.unsqueeze(-1)
+            
+            # Also reshape tokens_mask if it has the same issue
+            if tokens_mask.dim() == 2:
+                tokens_mask = tokens_mask.unsqueeze(-1)
+                
+            # Expand to full size (batch_size, seq_len, audio_num_codebooks+1)
+            tokens = tokens.expand(-1, -1, self.args.audio_num_codebooks+1)
+            tokens_mask = tokens_mask.expand(-1, -1, self.args.audio_num_codebooks+1)
+        
+        # Now tokens should have 3 dimensions
         b, s, _ = tokens.size()
 
         assert self.backbone.caches_are_enabled(), "backbone caches are not enabled"
-        
-        # Use cached causal mask for efficiency
         curr_backbone_mask = _index_causal_mask(self.backbone_causal_mask, input_pos)
         
-        # Embedding and input preparation
-        embeds = self._embed_tokens(tokens)
-        masked_embeds = embeds * tokens_mask.unsqueeze(-1)
-        h = masked_embeds.sum(dim=2)
+        # Ensure all tensors have the same dtype before processing
+        embeds = self._embed_tokens(tokens).to(dtype=dtype)
+        masked_embeds = embeds * tokens_mask.unsqueeze(-1).to(dtype=dtype)
+        h = masked_embeds.sum(dim=2).to(dtype=dtype)  # Ensure dtype consistency
         
-        # Main backbone forward pass with mixed precision
-        with torch.cuda.amp.autocast(enabled=True):
-            h = self.backbone(h, input_pos=input_pos, mask=curr_backbone_mask).to(dtype=dtype)
-        
-        # Extract last hidden state for prediction
+        # Explicitly disable autocast for backbone to avoid dtype changes
+        # This is the key fix for the KV cache dtype mismatch
+        with torch.autocast(device_type='cuda', enabled=False):
+            h = self.backbone(h.to(dtype=dtype), input_pos=input_pos, mask=curr_backbone_mask)
+            h = h.to(dtype=dtype)  # Enforce consistency
+
         last_h = h[:, -1, :]
         c0_logits = self.codebook0_head(last_h)
         c0_sample = sample_topk(c0_logits, topk, temperature)
-        c0_embed = self._embed_audio(0, c0_sample)
+        c0_embed = self._embed_audio(0, c0_sample).to(dtype=dtype)
 
-        # Initial decoder state
         curr_h = torch.cat([last_h.unsqueeze(1), c0_embed], dim=1)
         curr_sample = c0_sample.clone()
         curr_pos = torch.arange(0, curr_h.size(1), device=curr_h.device).unsqueeze(0).repeat(curr_h.size(0), 1)
 
-        # Reset decoder caches for this new frame
+        # Decoder caches must be reset every frame.
         self.decoder.reset_caches()
         
-        # Process remaining codebooks
-        with torch.cuda.amp.autocast(enabled=True):
+        # Explicitly disable autocast for decoder to avoid dtype changes
+        with torch.autocast(device_type='cuda', enabled=False):
             for i in range(1, self.args.audio_num_codebooks):
                 curr_decoder_mask = _index_causal_mask(self.decoder_causal_mask, curr_pos)
-                decoder_h = self.decoder(self.projection(curr_h), input_pos=curr_pos, mask=curr_decoder_mask).to(
-                    dtype=dtype
-                )
+                
+                # Ensure consistent dtype for each operation
+                projection_out = self.projection(curr_h.to(dtype=dtype)).to(dtype=dtype)
+                decoder_h = self.decoder(projection_out, input_pos=curr_pos, mask=curr_decoder_mask)
+                decoder_h = decoder_h.to(dtype=dtype)
+                
                 ci_logits = torch.mm(decoder_h[:, -1, :], self.audio_head[i - 1])
                 ci_sample = sample_topk(ci_logits, topk, temperature)
-                ci_embed = self._embed_audio(i, ci_sample)
+                ci_embed = self._embed_audio(i, ci_sample).to(dtype=dtype)
 
                 curr_h = ci_embed
                 curr_sample = torch.cat([curr_sample, ci_sample], dim=1)
