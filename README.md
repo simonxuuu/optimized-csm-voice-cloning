@@ -52,7 +52,7 @@ Before using the model, you need to accept the terms on Hugging Face:
 
 1. Record a clear audio sample of your voice (2-3 minutes is recommended)
 2. Save it as an MP3 or WAV file
-3. Transcribe the audio using Whisper or another transcription tool to get the exact text
+3. Transcribe the audio usfing Whisper or another transcription tool to get the exact text
 
 ## Running Voice Cloning Locally
 

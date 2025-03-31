@@ -5,7 +5,7 @@ import modal
 # Define the Modal app
 app = modal.App("csm-voice-cloning")
 
-# Set up the image with required dependencies
+# Set up the image with required dependencgies
 image = (
     modal.Image.debian_slim(python_version="3.10")
     .apt_install("git", "ffmpeg", "libsox-dev", "libsox-fmt-all", "sox")  # Added sox libraries
