@@ -1,5 +1,8 @@
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Optional, Any
+import pickle
+import os
+import time
 
 import torch
 import torchaudio
@@ -10,6 +13,9 @@ from tokenizers.processors import TemplateProcessing
 from transformers import AutoTokenizer
 from watermarking import CSM_1B_GH_WATERMARK, load_watermarker, watermark
 
+# Voice cache directory
+VOICE_CACHE_DIR = "./voice_cache"
+os.makedirs(VOICE_CACHE_DIR, exist_ok=True)
 
 @dataclass
 class Segment:
@@ -56,6 +62,9 @@ class Generator:
 
         self.sample_rate = mimi.sample_rate
         self.device = device
+        
+        # Voice cache storage
+        self.voice_cache = {}
 
     def _tokenize_text_segment(self, text: str, speaker: int) -> Tuple[torch.Tensor, torch.Tensor]:
         frame_tokens = []
@@ -102,6 +111,144 @@ class Generator:
         audio_tokens, audio_masks = self._tokenize_audio(segment.audio)
 
         return torch.cat([text_tokens, audio_tokens], dim=0), torch.cat([text_masks, audio_masks], dim=0)
+
+    def save_voice(self, voice_id: str, segment: Segment, filepath: Optional[str] = None) -> str:
+        """
+        Save a processed voice segment for later reuse.
+        
+        Args:
+            voice_id: Identifier for the voice
+            segment: The voice segment to save
+            filepath: Optional custom path to save the voice data
+            
+        Returns:
+            The path where the voice was saved
+        """
+        if filepath is None:
+            # Create a standardized filename
+            filepath = os.path.join(VOICE_CACHE_DIR, f"{voice_id}.voice.pkl")
+            
+        # Store in memory cache
+        self.voice_cache[voice_id] = segment
+        
+        # Save to disk
+        voice_data = {
+            "segment": segment,
+            "sample_rate": self.sample_rate,
+            "created_at": time.time(),
+        }
+        
+        with open(filepath, "wb") as f:
+            pickle.dump(voice_data, f)
+            
+        print(f"Voice '{voice_id}' saved to {filepath}")
+        return filepath
+    
+    def load_voice(self, voice_id: str, filepath: Optional[str] = None) -> Optional[Segment]:
+        """
+        Load a voice from cache or file.
+        
+        Args:
+            voice_id: Identifier for the voice
+            filepath: Optional path to load from (otherwise uses standard path)
+            
+        Returns:
+            The loaded voice segment or None if not found
+        """
+        # Check memory cache first
+        if voice_id in self.voice_cache:
+            return self.voice_cache[voice_id]
+            
+        # Determine filepath if not provided
+        if filepath is None:
+            filepath = os.path.join(VOICE_CACHE_DIR, f"{voice_id}.voice.pkl")
+            
+        # Load from disk if exists
+        if os.path.exists(filepath):
+            try:
+                with open(filepath, "rb") as f:
+                    voice_data = pickle.load(f)
+                
+                segment = voice_data["segment"]
+                
+                # Store in memory cache for future use
+                self.voice_cache[voice_id] = segment
+                
+                print(f"Voice '{voice_id}' loaded from {filepath}")
+                return segment
+            except Exception as e:
+                print(f"Error loading voice: {e}")
+                return None
+        else:
+            print(f"Voice file not found: {filepath}")
+            return None
+    
+    def list_cached_voices(self) -> List[str]:
+        """
+        List all available cached voices.
+        
+        Returns:
+            List of voice IDs that are available
+        """
+        # List from memory cache
+        memory_voices = list(self.voice_cache.keys())
+        
+        # List from disk cache
+        disk_voices = []
+        for filename in os.listdir(VOICE_CACHE_DIR):
+            if filename.endswith(".voice.pkl"):
+                voice_id = filename.split(".")[0]
+                disk_voices.append(voice_id)
+                
+        # Combine and deduplicate
+        all_voices = list(set(memory_voices + disk_voices))
+        return all_voices
+    
+    def clone_and_save_voice(
+        self, 
+        audio_path: str, 
+        voice_id: str, 
+        reference_text: str = ""
+    ) -> Optional[Segment]:
+        """
+        Process an audio file, create a voice segment, and save it for reuse.
+        
+        Args:
+            audio_path: Path to the audio file to process
+            voice_id: ID to give the processed voice
+            reference_text: Optional reference text for the audio
+            
+        Returns:
+            The processed voice segment or None if failed
+        """
+        try:
+            # Load and process audio
+            audio, sr = torchaudio.load(audio_path)
+            audio = audio.mean(dim=0)  # Convert to mono
+            
+            # Resample if needed
+            if sr != self.sample_rate:
+                audio = torchaudio.functional.resample(
+                    audio, orig_freq=sr, new_freq=self.sample_rate
+                )
+            
+            # Normalize audio volume
+            audio = audio / (torch.max(torch.abs(audio)) + 1e-8)
+            
+            # Create segment
+            segment = Segment(
+                text=reference_text,
+                speaker=999,
+                audio=audio
+            )
+            
+            # Save the voice
+            self.save_voice(voice_id, segment)
+            
+            return segment
+        except Exception as e:
+            print(f"Error processing voice: {e}")
+            return None
 
     @torch.inference_mode()
     def generate(
@@ -162,6 +309,54 @@ class Generator:
         audio = torchaudio.functional.resample(audio, orig_freq=wm_sample_rate, new_freq=self.sample_rate)
 
         return audio
+
+    @torch.inference_mode()
+    def generate_with_cached_voice(
+        self,
+        text: str,
+        voice_id: str,
+        max_audio_length_ms: float = 5_000,
+        temperature: float = 0.6,
+        topk: int = 20,
+        max_seq_len: int = 2048,
+    ) -> torch.Tensor:
+        """
+        Generate speech using a cached voice.
+        
+        Args:
+            text: The text to speak
+            voice_id: Voice ID or filepath to use
+            max_audio_length_ms: Maximum output audio length in ms
+            temperature: Generation temperature (higher = more diverse)
+            topk: Top-k sampling parameter
+            max_seq_len: Maximum sequence length
+            
+        Returns:
+            Generated audio tensor
+        """
+        # Load voice
+        if os.path.exists(voice_id) and voice_id.endswith(".voice.pkl"):
+            # If voice_id is actually a filepath
+            filepath = voice_id
+            voice_id = os.path.basename(filepath).split(".")[0]
+            segment = self.load_voice(voice_id, filepath)
+        else:
+            # Try to load by ID
+            segment = self.load_voice(voice_id)
+            
+        if segment is None:
+            raise ValueError(f"Voice '{voice_id}' not found")
+            
+        # Generate with the loaded voice
+        return self.generate(
+            text=text,
+            speaker=999,
+            context=[segment],
+            max_audio_length_ms=max_audio_length_ms,
+            temperature=temperature,
+            topk=topk,
+            max_seq_len=max_seq_len
+        )
 
 
 def load_csm_1b(ckpt_path: str = "ckpt.pt", device: str = "cuda", compile_model: bool = True, use_cached_compile: bool = True) -> Generator:
